@@ -442,8 +442,8 @@ def fetch_edgar_filings(ticker: str, cik: str, seen: set) -> list[dict]:
             seen.add(link)
     return new_filings
 
-def collect_edgar(seen: set) -> int:
-    """관심종목 공시 수집 → 기업공시 탭 저장. 저장 건수 반환."""
+def collect_edgar(seen: set) -> dict:
+    """관심종목 공시 수집 → 기업공시 탭 저장. 티커별 저장 건수 dict 반환."""
     cik_map = {}
     try:
         res = requests.get(
@@ -455,11 +455,11 @@ def collect_edgar(seen: set) -> int:
                    for v in data.values()}
     except Exception as e:
         print(f"⚠️ EDGAR CIK 일괄 조회 실패: {e}")
-        return 0
+        return {t: 0 for t in AUTO_TICKERS}
 
     ws = connect_tab(TAB_FILING)
     today = datetime.now(KST).strftime("%Y-%m-%d")
-    count = 0
+    counts = {t: 0 for t in AUTO_TICKERS}
 
     for ticker in AUTO_TICKERS:
         info = cik_map.get(ticker.upper())
@@ -517,11 +517,11 @@ def collect_edgar(seen: set) -> int:
                         link,
                     ])
                     print(f"  📋 [{ticker}] {form} 저장: {entry.get('title','')[:50]}")
-                    count += 1
+                    counts[ticker] += 1
 
                 seen.add(link)
 
-    return count
+    return counts
 
 def _get_edgar_doc_url(index_url: str) -> str | None:
     """EDGAR index 페이지에서 주 문서(htm/txt) URL 추출."""
@@ -539,11 +539,11 @@ def _get_edgar_doc_url(index_url: str) -> str | None:
 # ------------------------------------------------------------------ #
 #  구글 뉴스 RSS 자동 수집                                              #
 # ------------------------------------------------------------------ #
-def collect_news(seen: set) -> int:
-    """관심종목 뉴스 수집 → 텍스트 탭 저장. 저장 건수 반환."""
+def collect_news(seen: set) -> dict:
+    """관심종목 뉴스 수집 → 텍스트 탭 저장. 티커별 저장 건수 dict 반환."""
     ws = connect_tab(TAB_TEXT)
     today = datetime.now(KST).strftime("%Y-%m-%d")
-    count = 0
+    counts = {t: 0 for t in AUTO_TICKERS}
 
     for ticker in AUTO_TICKERS:
         url = (
@@ -580,43 +580,51 @@ def collect_news(seen: set) -> int:
                     analysis.get("risks", ""),
                 ])
                 print(f"  📰 [{ticker}] 뉴스 저장: {title[:50]}")
-                count += 1
+                counts[ticker] += 1
                 saved += 1
 
             seen.add(link)
 
-    return count
+    return counts
 
 # ------------------------------------------------------------------ #
 #  자동 수집 메인 잡 (매일 밤 11시 KST)                                  #
 # ------------------------------------------------------------------ #
-async def run_auto_collect(context: ContextTypes.DEFAULT_TYPE):
-    print(f"\n🔄 자동 수집 시작 [{datetime.now(KST).strftime('%Y-%m-%d %H:%M')} KST]")
+async def run_auto_collect(context: ContextTypes.DEFAULT_TYPE, is_manual: bool = False):
+    label = "수동" if is_manual else "자동"
+    now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    print(f"\n🔄 {label} 수집 시작 [{now_str} KST]")
     chat_id = load_chat_id()
     seen = load_seen()
 
     if chat_id:
-        await context.bot.send_message(chat_id=chat_id, text="🔄 관심종목 자동 수집 시작...")
+        await context.bot.send_message(chat_id=chat_id, text="🔄 수집 중...")
 
     try:
-        edgar_count = collect_edgar(seen)
-        news_count  = collect_news(seen)
+        edgar_counts = collect_edgar(seen)
+        news_counts  = collect_news(seen)
         save_seen(seen)
 
+        # 티커별 합산 (공시 + 뉴스)
+        ticker_totals = {t: edgar_counts.get(t, 0) + news_counts.get(t, 0) for t in AUTO_TICKERS}
+        total = sum(ticker_totals.values())
+        collect_time = datetime.now(KST).strftime("%H:%M")
+
+        ticker_lines = "\n".join(f"- {t}: {ticker_totals[t]}건" for t in AUTO_TICKERS)
         msg = (
-            f"✅ 자동 수집 완료\n"
-            f"📋 공시: {edgar_count}건\n"
-            f"📰 뉴스: {news_count}건\n"
-            f"(내일 오전 7시 브리핑에 포함됩니다)"
+            f"✅ 수집 완료! ({label})\n"
+            f"📊 총 {total}건 저장됨\n"
+            f"{ticker_lines}\n"
+            f"🕐 수집 시각: {collect_time}"
         )
-        print(f"✅ 수집 완료 — 공시 {edgar_count}건 / 뉴스 {news_count}건")
+        print(f"✅ {label} 수집 완료 — 총 {total}건 ({', '.join(f'{t}:{ticker_totals[t]}' for t in AUTO_TICKERS)})")
         if chat_id:
             await context.bot.send_message(chat_id=chat_id, text=msg)
 
     except Exception as e:
-        print(f"❌ 자동 수집 오류: {e}")
+        print(f"❌ {label} 수집 오류: {e}")
         if chat_id:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ 자동 수집 오류: {e}")
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ {label} 수집 오류: {e}")
 
 # ------------------------------------------------------------------ #
 #  Chat ID 저장/로드                                                   #
@@ -754,8 +762,8 @@ async def handle_briefing_now(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_briefing(context.bot)
 
 async def handle_collect_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 관심종목 수집 시작... (수분 소요)")
-    await run_auto_collect(context)
+    await update.message.reply_text("🔄 수집 중...")
+    await run_auto_collect(context, is_manual=True)
 
 # ------------------------------------------------------------------ #
 #  봇 실행                                                             #
