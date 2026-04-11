@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import json
+from urllib.parse import urlparse, parse_qs
 
 # ---- 설정 ----
 SHEET_NAME   = "미국주식 리서치"
@@ -518,14 +519,18 @@ def collect_edgar(seen: set, is_first_run: bool = False, cutoff_days: int = 7) -
                 # ④ seen에 즉시 등록 (이후 루프나 재실행에서 중복 방지)
                 seen.add(link)
 
-                # 공시 index 페이지에서 실제 문서 URL 추출
+                # EDGAR index → 실제 문서 URL → 내용 가져오기
                 doc_url = _get_edgar_doc_url(link)
-                content = get_web_content(doc_url or link)
+                content = get_edgar_content(doc_url) if doc_url else None
+                if not content:
+                    # index 자체라도 시도
+                    content = get_edgar_content(link)
 
                 if content:
                     analysis = gemini_analyze(content)
                 else:
-                    # 내용 못 가져오면 제목만으로 간단 저장
+                    # 내용을 전혀 못 가져온 경우 제목만으로 저장
+                    print(f"  ⚠️ [{ticker}] {form} 내용 없음 — 제목만 저장")
                     analysis = {
                         "content_type": "기업공시",
                         "company": company_name,
@@ -557,18 +562,57 @@ def collect_edgar(seen: set, is_first_run: bool = False, cutoff_days: int = 7) -
 
     return counts
 
+def _resolve_edgar_href(href: str) -> str | None:
+    """
+    EDGAR 링크에서 실제 문서 경로를 반환.
+    - /ix?doc=/Archives/.../file.htm  → /Archives/.../file.htm
+    - /Archives/.../file.htm          → 그대로
+    """
+    if not href:
+        return None
+    if "ix?doc=" in href:
+        parsed = urlparse(href)
+        doc_path = parse_qs(parsed.query).get("doc", [None])[0]
+        href = doc_path if doc_path else href
+    if href.endswith((".htm", ".html", ".txt")) and "index" not in href.lower():
+        return ("https://www.sec.gov" + href) if href.startswith("/") else href
+    return None
+
 def _get_edgar_doc_url(index_url: str) -> str | None:
-    """EDGAR index 페이지에서 주 문서(htm/txt) URL 추출."""
+    """EDGAR index 페이지에서 주 문서 직접 URL 추출 (ix?doc= 래퍼 우회)."""
     try:
         res = requests.get(index_url, headers={"User-Agent": EDGAR_UA}, timeout=10)
+        if res.status_code != 200:
+            return None
         soup = BeautifulSoup(res.text, "html.parser")
         for a in soup.select("table.tableFile a"):
-            href = a.get("href", "")
-            if href.endswith((".htm", ".html", ".txt")) and "index" not in href.lower():
-                return "https://www.sec.gov" + href if href.startswith("/") else href
-    except:
-        pass
+            resolved = _resolve_edgar_href(a.get("href", ""))
+            if resolved:
+                return resolved
+    except Exception as e:
+        print(f"⚠️ EDGAR index 파싱 실패: {e}")
     return None
+
+def get_edgar_content(url: str) -> str | None:
+    """SEC EDGAR 문서를 직접 가져옴 (EDGAR User-Agent 사용, ix?doc= 우회)."""
+    # ix?doc= 래퍼가 남아있으면 실제 경로로 변환
+    resolved = _resolve_edgar_href(url) or url
+    try:
+        res = requests.get(resolved, headers={"User-Agent": EDGAR_UA}, timeout=15)
+        if res.status_code != 200:
+            print(f"⚠️ EDGAR 문서 HTTP {res.status_code}: {resolved}")
+            return None
+        soup = BeautifulSoup(res.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        text = soup.get_text(separator=" ", strip=True)
+        if len(text) < 200:
+            print(f"⚠️ EDGAR 문서 내용 너무 짧음({len(text)}자): {resolved}")
+            return None
+        return text[:12000]
+    except Exception as e:
+        print(f"⚠️ EDGAR 문서 요청 실패: {e}")
+        return None
 
 # ------------------------------------------------------------------ #
 #  구글 뉴스 RSS 자동 수집                                              #
