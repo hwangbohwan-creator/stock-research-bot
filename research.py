@@ -5,9 +5,11 @@ from google.genai import types
 import requests
 from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-from datetime import datetime
+import pytz
+import yfinance as yf
+from datetime import datetime, timedelta, time as dtime
 import tempfile
 import os
 import re
@@ -23,6 +25,12 @@ TELEGRAM_TOKEN  = "8513472599:AAFT6cGolTaEfqlY5_y5FrF_Dn_-DWQamcM"
 TAB_YOUTUBE = "유튜브"
 TAB_TEXT    = "텍스트"
 TAB_FILING  = "기업공시"
+
+# 브리핑 설정
+BRIEFING_CHAT_ID = None          # 봇에 /register 보내면 자동 저장
+CHAT_ID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_id.txt")
+WATCHLIST = ["CRCL", "RKLB", "IREN", "TSLA", "INTC", "BTC-USD", "ETH-USD"]
+KST = pytz.timezone("Asia/Seoul")
 
 HEADERS_DEFAULT = ["날짜", "회사명", "티커", "소스타입", "발표자", "링크", "핵심요약", "투자포인트", "리스크"]
 HEADERS_FILING  = ["날짜", "기업명", "티커", "공시유형", "핵심요약", "주요내용", "투자영향", "링크/파일명"]
@@ -376,13 +384,168 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ 오류: {e}")
 
 # ------------------------------------------------------------------ #
+#  Chat ID 저장/로드                                                   #
+# ------------------------------------------------------------------ #
+def load_chat_id() -> int | None:
+    global BRIEFING_CHAT_ID
+    if os.path.exists(CHAT_ID_FILE):
+        with open(CHAT_ID_FILE) as f:
+            val = f.read().strip()
+            if val:
+                BRIEFING_CHAT_ID = int(val)
+    return BRIEFING_CHAT_ID
+
+def save_chat_id(chat_id: int):
+    global BRIEFING_CHAT_ID
+    BRIEFING_CHAT_ID = chat_id
+    with open(CHAT_ID_FILE, "w") as f:
+        f.write(str(chat_id))
+
+# ------------------------------------------------------------------ #
+#  주가 조회                                                            #
+# ------------------------------------------------------------------ #
+def get_prices() -> str:
+    lines = []
+    for ticker in WATCHLIST:
+        try:
+            t = yf.Ticker(ticker)
+            info = t.fast_info
+            price = info.last_price
+            prev  = info.previous_close
+            change = ((price - prev) / prev * 100) if prev else 0
+            sign  = "▲" if change >= 0 else "▼"
+            label = ticker.replace("-USD", "")
+            lines.append(f"  {label}: ${price:,.2f} {sign}{abs(change):.2f}%")
+        except Exception as e:
+            lines.append(f"  {ticker.replace('-USD','')}: 조회 실패")
+    return "\n".join(lines)
+
+# ------------------------------------------------------------------ #
+#  전날 시트 데이터 읽기                                                #
+# ------------------------------------------------------------------ #
+def get_yesterday_rows(tab_name: str) -> list[dict]:
+    try:
+        ws = connect_tab(tab_name)
+        rows = ws.get_all_records()
+        yesterday = (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+        return [r for r in rows if str(r.get("날짜", "")).startswith(yesterday)]
+    except:
+        return []
+
+# ------------------------------------------------------------------ #
+#  Gemini 탭별 요약                                                    #
+# ------------------------------------------------------------------ #
+def summarize_tab(tab_name: str, rows: list[dict]) -> str:
+    if not rows:
+        return "어제 저장된 내용 없음"
+
+    if tab_name == TAB_FILING:
+        items = "\n".join(
+            f"- [{r.get('티커','')}] {r.get('기업명','')} / {r.get('공시유형','')} / "
+            f"{r.get('핵심요약','')[:80]} / 투자영향: {r.get('투자영향','')[:60]}"
+            for r in rows
+        )
+        prompt = f"다음 기업공시 목록을 3-5줄로 핵심만 한국어로 요약하세요:\n{items}"
+    else:
+        col_summary = "핵심요약"
+        col_company = "회사명"
+        col_ticker  = "티커"
+        items = "\n".join(
+            f"- [{r.get(col_ticker,'')}] {r.get(col_company,'')} / {r.get(col_summary,'')[:80]}"
+            for r in rows
+        )
+        prompt = f"다음 주식 관련 콘텐츠 목록을 3-5줄로 핵심만 한국어로 요약하세요:\n{items}"
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        return response.text.strip()
+    except:
+        return "\n".join(
+            f"• [{r.get('티커','?')}] {r.get('회사명', r.get('기업명','?'))}"
+            for r in rows
+        )
+
+# ------------------------------------------------------------------ #
+#  브리핑 메시지 조립 및 발송                                           #
+# ------------------------------------------------------------------ #
+async def send_briefing(bot: Bot):
+    chat_id = load_chat_id()
+    if not chat_id:
+        print("⚠️ 브리핑 수신자 미등록 — 텔레그램에서 /register 명령어를 보내세요")
+        return
+
+    now_kst = datetime.now(KST).strftime("%Y년 %m월 %d일")
+    yesterday_kst = (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+    print(f"📨 브리핑 발송 시작 ({now_kst})")
+
+    yt_rows   = get_yesterday_rows(TAB_YOUTUBE)
+    txt_rows  = get_yesterday_rows(TAB_TEXT)
+    fil_rows  = get_yesterday_rows(TAB_FILING)
+
+    yt_summary  = summarize_tab(TAB_YOUTUBE, yt_rows)
+    txt_summary = summarize_tab(TAB_TEXT,    txt_rows)
+    fil_summary = summarize_tab(TAB_FILING,  fil_rows)
+    prices      = get_prices()
+
+    msg = (
+        f"📊 *오늘의 주식 브리핑* ({now_kst})\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"📌 *어제({yesterday_kst}) 저장된 종목 요약*\n\n"
+        f"🎬 *유튜브 탭* ({len(yt_rows)}건)\n{yt_summary}\n\n"
+        f"📝 *텍스트/뉴스 탭* ({len(txt_rows)}건)\n{txt_summary}\n\n"
+        f"📋 *공시 탭* ({len(fil_rows)}건)\n{fil_summary}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 *관심종목 현재가*\n{prices}"
+    )
+
+    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+    print("✅ 브리핑 발송 완료")
+
+# ------------------------------------------------------------------ #
+#  /register, /briefing 커맨드 핸들러                                   #
+# ------------------------------------------------------------------ #
+async def handle_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_chat_id(update.effective_chat.id)
+    await update.message.reply_text(
+        "✅ 브리핑 수신 등록 완료!\n매일 오전 7시(한국 시간)에 브리핑을 받습니다.\n"
+        "/briefing 으로 지금 바로 받아볼 수 있어요."
+    )
+
+async def handle_briefing_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 브리핑 생성 중...")
+    await send_briefing(context.bot)
+
+# ------------------------------------------------------------------ #
 #  봇 실행                                                             #
 # ------------------------------------------------------------------ #
 def run_bot():
+    from telegram.ext import CommandHandler
     print("🤖 텔레그램 봇 시작...")
+    load_chat_id()
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # 커맨드 핸들러
+    app.add_handler(CommandHandler("register", handle_register))
+    app.add_handler(CommandHandler("briefing", handle_briefing_now))
+
+    # 메시지 핸들러
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # 매일 오전 7시(KST) 브리핑 — PTB 내장 JobQueue 사용
+    async def briefing_job(context: ContextTypes.DEFAULT_TYPE):
+        await send_briefing(context.bot)
+
+    app.job_queue.run_daily(
+        briefing_job,
+        time=dtime(hour=7, minute=0, second=0, tzinfo=KST),
+    )
+    print("⏰ 브리핑 스케줄 등록: 매일 오전 7:00 KST")
+
     app.run_polling()
 
 # ------------------------------------------------------------------ #

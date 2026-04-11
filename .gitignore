@@ -6,6 +6,7 @@ credentials.json:Zone.Identifier
 # 봇 런타임 파일
 bot.pid
 bot.log
+chat_id.txt
 nohup.out
 
 # Python
