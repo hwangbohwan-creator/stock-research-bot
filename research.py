@@ -391,11 +391,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------------------------------------------------ #
 #  중복 방지 — seen URL 관리                                            #
 # ------------------------------------------------------------------ #
-def load_seen() -> set:
+def load_seen() -> tuple[set, bool]:
+    """seen URL 집합과 첫 실행 여부를 반환한다."""
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE) as f:
-            return set(json.load(f))
-    return set()
+            return set(json.load(f)), False
+    return set(), True
 
 def save_seen(seen: set):
     with open(SEEN_FILE, "w") as f:
@@ -442,8 +443,12 @@ def fetch_edgar_filings(ticker: str, cik: str, seen: set) -> list[dict]:
             seen.add(link)
     return new_filings
 
-def collect_edgar(seen: set) -> dict:
-    """관심종목 공시 수집 → 기업공시 탭 저장. 티커별 저장 건수 dict 반환."""
+def collect_edgar(seen: set, is_first_run: bool = False) -> dict:
+    """관심종목 공시 수집 → 기업공시 탭 저장. 티커별 저장 건수 dict 반환.
+
+    is_first_run=True: 최근 7일치 공시만 수집 (seen_urls.json 없을 때)
+    is_first_run=False: seen에 없는 새 URL만 수집
+    """
     cik_map = {}
     try:
         res = requests.get(
@@ -461,6 +466,14 @@ def collect_edgar(seen: set) -> dict:
     today = datetime.now(KST).strftime("%Y-%m-%d")
     counts = {t: 0 for t in AUTO_TICKERS}
 
+    # 첫 실행 시 7일 기준일 계산
+    cutoff_date = (datetime.now(KST) - timedelta(days=7)).strftime("%Y-%m-%d") if is_first_run else None
+    # 첫 실행은 더 많은 항목을 가져와 7일치를 확보, 이후엔 최신 10건으로 충분
+    fetch_count = 40 if is_first_run else 10
+
+    if is_first_run:
+        print(f"  ℹ️ 첫 실행 — 최근 7일 ({cutoff_date} 이후) 공시만 수집")
+
     for ticker in AUTO_TICKERS:
         info = cik_map.get(ticker.upper())
         if not info:
@@ -468,20 +481,29 @@ def collect_edgar(seen: set) -> dict:
             continue
         cik, company_name = info
 
-        # 공시 분석 전 공시 목록만 먼저 가져옴
         for form in EDGAR_FORMS:
             url = (
                 f"https://www.sec.gov/cgi-bin/browse-edgar"
                 f"?action=getcompany&CIK={cik}&type={form}"
-                f"&dateb=&owner=include&count=5&output=atom"
+                f"&dateb=&owner=include&count={fetch_count}&output=atom"
             )
             feedparser.USER_AGENT = EDGAR_UA
             feed = feedparser.parse(url)
 
             for entry in feed.entries:
                 link = entry.get("link", "")
-                if not link or link in seen:
+                if not link:
                     continue
+
+                # 첫 실행: 7일 이내 항목만, 이후: seen에 없는 항목만
+                if is_first_run:
+                    entry_date = entry.get("updated", "")[:10]
+                    if entry_date < cutoff_date:
+                        seen.add(link)   # 오래된 항목은 seen에 등록만 하고 건너뜀
+                        continue
+                else:
+                    if link in seen:
+                        continue
 
                 # 공시 index 페이지에서 실제 문서 URL 추출
                 doc_url = _get_edgar_doc_url(link)
@@ -595,29 +617,27 @@ async def run_auto_collect(context: ContextTypes.DEFAULT_TYPE, is_manual: bool =
     now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     print(f"\n🔄 {label} 수집 시작 [{now_str} KST]")
     chat_id = load_chat_id()
-    seen = load_seen()
+    seen, is_first_run = load_seen()
 
     if chat_id:
         await context.bot.send_message(chat_id=chat_id, text="🔄 수집 중...")
 
     try:
-        edgar_counts = collect_edgar(seen)
+        edgar_counts = collect_edgar(seen, is_first_run=is_first_run)
         news_counts  = collect_news(seen)
         save_seen(seen)
 
-        # 티커별 합산 (공시 + 뉴스)
-        ticker_totals = {t: edgar_counts.get(t, 0) + news_counts.get(t, 0) for t in AUTO_TICKERS}
-        total = sum(ticker_totals.values())
+        edgar_total = sum(edgar_counts.values())
         collect_time = datetime.now(KST).strftime("%H:%M")
 
-        ticker_lines = "\n".join(f"- {t}: {ticker_totals[t]}건" for t in AUTO_TICKERS)
+        ticker_lines = "\n".join(f"- {t}: {edgar_counts.get(t, 0)}건" for t in AUTO_TICKERS)
         msg = (
             f"✅ 수집 완료! ({label})\n"
-            f"📊 총 {total}건 저장됨\n"
+            f"📊 새로 수집된 공시: {edgar_total}건\n"
             f"{ticker_lines}\n"
             f"🕐 수집 시각: {collect_time}"
         )
-        print(f"✅ {label} 수집 완료 — 총 {total}건 ({', '.join(f'{t}:{ticker_totals[t]}' for t in AUTO_TICKERS)})")
+        print(f"✅ {label} 수집 완료 — 공시 {edgar_total}건 ({', '.join(f'{t}:{edgar_counts.get(t,0)}' for t in AUTO_TICKERS)})")
         if chat_id:
             await context.bot.send_message(chat_id=chat_id, text=msg)
 
