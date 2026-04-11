@@ -1,0 +1,20 @@
+# 보안 파일
+credentials.json
+credentials.json:Zone.Identifier
+*.json.bak
+
+# 봇 런타임 파일
+bot.pid
+bot.log
+nohup.out
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# 에디터
+.vscode/
+.idea/
+*.swp
