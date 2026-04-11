@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+import feedparser
 import pytz
 import yfinance as yf
 from datetime import datetime, timedelta, time as dtime
@@ -19,7 +20,7 @@ import json
 # ---- 설정 ----
 SHEET_NAME   = "미국주식 리서치"
 CREDS_FILE   = "credentials.json"
-GEMINI_API_KEY  = "AIzaSyCqFyOMfSDNpxKRqwTi8RrUWmJxAWJTqe4"
+GEMINI_API_KEY  = "AIzaSyAhTicJqr1UWlqPAGbKyLg_Xj0KUpdQJnA"
 TELEGRAM_TOKEN  = "8513472599:AAFT6cGolTaEfqlY5_y5FrF_Dn_-DWQamcM"
 
 TAB_YOUTUBE = "유튜브"
@@ -27,10 +28,14 @@ TAB_TEXT    = "텍스트"
 TAB_FILING  = "기업공시"
 
 # 브리핑 설정
-BRIEFING_CHAT_ID = None          # 봇에 /register 보내면 자동 저장
-CHAT_ID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_id.txt")
-WATCHLIST = ["CRCL", "RKLB", "IREN", "TSLA", "INTC", "BTC-USD", "ETH-USD"]
-KST = pytz.timezone("Asia/Seoul")
+BRIEFING_CHAT_ID = None
+CHAT_ID_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_id.txt")
+SEEN_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen_urls.json")
+WATCHLIST     = ["CRCL", "RKLB", "IREN", "TSLA", "INTC", "BTC-USD", "ETH-USD"]
+AUTO_TICKERS  = ["TSLA", "IREN", "RKLB", "CRCL"]   # 자동 수집 관심종목
+EDGAR_FORMS   = ["8-K", "10-Q", "10-K"]
+EDGAR_UA      = "stock-research-bot contact@research.com"
+KST           = pytz.timezone("Asia/Seoul")
 
 HEADERS_DEFAULT = ["날짜", "회사명", "티커", "소스타입", "발표자", "링크", "핵심요약", "투자포인트", "리스크"]
 HEADERS_FILING  = ["날짜", "기업명", "티커", "공시유형", "핵심요약", "주요내용", "투자영향", "링크/파일명"]
@@ -384,6 +389,236 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ 오류: {e}")
 
 # ------------------------------------------------------------------ #
+#  중복 방지 — seen URL 관리                                            #
+# ------------------------------------------------------------------ #
+def load_seen() -> set:
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE) as f:
+            return set(json.load(f))
+    return set()
+
+def save_seen(seen: set):
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(seen), f)
+
+# ------------------------------------------------------------------ #
+#  SEC EDGAR 공시 자동 수집                                             #
+# ------------------------------------------------------------------ #
+def get_edgar_cik(ticker: str) -> str | None:
+    try:
+        res = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": EDGAR_UA}, timeout=10,
+        )
+        data = res.json()
+        lookup = {v["ticker"]: str(v["cik_str"]).zfill(10) for v in data.values()}
+        return lookup.get(ticker.upper())
+    except Exception as e:
+        print(f"⚠️ CIK 조회 실패 [{ticker}]: {e}")
+        return None
+
+def fetch_edgar_filings(ticker: str, cik: str, seen: set) -> list[dict]:
+    """새로운 공시만 반환 (중복 제외)."""
+    new_filings = []
+    for form in EDGAR_FORMS:
+        url = (
+            f"https://www.sec.gov/cgi-bin/browse-edgar"
+            f"?action=getcompany&CIK={cik}&type={form}"
+            f"&dateb=&owner=include&count=5&output=atom"
+        )
+        feedparser.USER_AGENT = EDGAR_UA
+        feed = feedparser.parse(url)
+        for entry in feed.entries:
+            link = entry.get("link", "")
+            if not link or link in seen:
+                continue
+            new_filings.append({
+                "ticker": ticker,
+                "form": form,
+                "title": entry.get("title", ""),
+                "link": link,
+                "date": entry.get("updated", "")[:10],
+            })
+            seen.add(link)
+    return new_filings
+
+def collect_edgar(seen: set) -> int:
+    """관심종목 공시 수집 → 기업공시 탭 저장. 저장 건수 반환."""
+    cik_map = {}
+    try:
+        res = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": EDGAR_UA}, timeout=10,
+        )
+        data = res.json()
+        cik_map = {v["ticker"]: (str(v["cik_str"]).zfill(10), v["title"])
+                   for v in data.values()}
+    except Exception as e:
+        print(f"⚠️ EDGAR CIK 일괄 조회 실패: {e}")
+        return 0
+
+    ws = connect_tab(TAB_FILING)
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    count = 0
+
+    for ticker in AUTO_TICKERS:
+        info = cik_map.get(ticker.upper())
+        if not info:
+            print(f"⚠️ CIK 없음: {ticker}")
+            continue
+        cik, company_name = info
+
+        # 공시 분석 전 공시 목록만 먼저 가져옴
+        for form in EDGAR_FORMS:
+            url = (
+                f"https://www.sec.gov/cgi-bin/browse-edgar"
+                f"?action=getcompany&CIK={cik}&type={form}"
+                f"&dateb=&owner=include&count=5&output=atom"
+            )
+            feedparser.USER_AGENT = EDGAR_UA
+            feed = feedparser.parse(url)
+
+            for entry in feed.entries:
+                link = entry.get("link", "")
+                if not link or link in seen:
+                    continue
+
+                # 공시 index 페이지에서 실제 문서 URL 추출
+                doc_url = _get_edgar_doc_url(link)
+                content = get_web_content(doc_url or link)
+
+                if content:
+                    analysis = gemini_analyze(content)
+                else:
+                    # 내용 못 가져오면 제목만으로 간단 저장
+                    analysis = {
+                        "content_type": "기업공시",
+                        "company": company_name,
+                        "ticker": ticker,
+                        "filing_type": form,
+                        "summary": entry.get("title", ""),
+                        "details": "",
+                        "impact": "",
+                    }
+
+                if analysis:
+                    analysis["content_type"] = "기업공시"
+                    analysis.setdefault("filing_type", form)
+                    analysis.setdefault("company", company_name)
+                    analysis.setdefault("ticker", ticker)
+                    ws.append_row([
+                        today,
+                        analysis.get("company", company_name),
+                        analysis.get("ticker", ticker),
+                        analysis.get("filing_type", form),
+                        analysis.get("summary", ""),
+                        analysis.get("details", ""),
+                        analysis.get("impact", ""),
+                        link,
+                    ])
+                    print(f"  📋 [{ticker}] {form} 저장: {entry.get('title','')[:50]}")
+                    count += 1
+
+                seen.add(link)
+
+    return count
+
+def _get_edgar_doc_url(index_url: str) -> str | None:
+    """EDGAR index 페이지에서 주 문서(htm/txt) URL 추출."""
+    try:
+        res = requests.get(index_url, headers={"User-Agent": EDGAR_UA}, timeout=10)
+        soup = BeautifulSoup(res.text, "html.parser")
+        for a in soup.select("table.tableFile a"):
+            href = a.get("href", "")
+            if href.endswith((".htm", ".html", ".txt")) and "index" not in href.lower():
+                return "https://www.sec.gov" + href if href.startswith("/") else href
+    except:
+        pass
+    return None
+
+# ------------------------------------------------------------------ #
+#  구글 뉴스 RSS 자동 수집                                              #
+# ------------------------------------------------------------------ #
+def collect_news(seen: set) -> int:
+    """관심종목 뉴스 수집 → 텍스트 탭 저장. 저장 건수 반환."""
+    ws = connect_tab(TAB_TEXT)
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    count = 0
+
+    for ticker in AUTO_TICKERS:
+        url = (
+            f"https://news.google.com/rss/search"
+            f"?q={ticker}+stock&hl=en-US&gl=US&ceid=US:en"
+        )
+        feed = feedparser.parse(url)
+        saved = 0
+
+        for entry in feed.entries:
+            if saved >= 3:
+                break
+            link = entry.get("link", "")
+            if not link or link in seen:
+                continue
+
+            title = entry.get("title", "")
+            # 구글 뉴스는 리다이렉트 URL → 본문 크롤링 불가, 제목+요약 사용
+            source = entry.get("source", {}).get("href", "")
+            raw_text = f"{title}. {entry.get('summary', '')}"
+            content = (get_web_content(source) if source else None) or raw_text
+            analysis = gemini_analyze(content)
+
+            if analysis:
+                ws.append_row([
+                    today,
+                    analysis.get("company", ticker),
+                    analysis.get("ticker", ticker),
+                    "뉴스",
+                    analysis.get("presenter", "Google News"),
+                    link,
+                    analysis.get("summary", title),
+                    analysis.get("investment_points", ""),
+                    analysis.get("risks", ""),
+                ])
+                print(f"  📰 [{ticker}] 뉴스 저장: {title[:50]}")
+                count += 1
+                saved += 1
+
+            seen.add(link)
+
+    return count
+
+# ------------------------------------------------------------------ #
+#  자동 수집 메인 잡 (매일 밤 11시 KST)                                  #
+# ------------------------------------------------------------------ #
+async def run_auto_collect(context: ContextTypes.DEFAULT_TYPE):
+    print(f"\n🔄 자동 수집 시작 [{datetime.now(KST).strftime('%Y-%m-%d %H:%M')} KST]")
+    chat_id = load_chat_id()
+    seen = load_seen()
+
+    if chat_id:
+        await context.bot.send_message(chat_id=chat_id, text="🔄 관심종목 자동 수집 시작...")
+
+    try:
+        edgar_count = collect_edgar(seen)
+        news_count  = collect_news(seen)
+        save_seen(seen)
+
+        msg = (
+            f"✅ 자동 수집 완료\n"
+            f"📋 공시: {edgar_count}건\n"
+            f"📰 뉴스: {news_count}건\n"
+            f"(내일 오전 7시 브리핑에 포함됩니다)"
+        )
+        print(f"✅ 수집 완료 — 공시 {edgar_count}건 / 뉴스 {news_count}건")
+        if chat_id:
+            await context.bot.send_message(chat_id=chat_id, text=msg)
+
+    except Exception as e:
+        print(f"❌ 자동 수집 오류: {e}")
+        if chat_id:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ 자동 수집 오류: {e}")
+
+# ------------------------------------------------------------------ #
 #  Chat ID 저장/로드                                                   #
 # ------------------------------------------------------------------ #
 def load_chat_id() -> int | None:
@@ -518,6 +753,10 @@ async def handle_briefing_now(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("📊 브리핑 생성 중...")
     await send_briefing(context.bot)
 
+async def handle_collect_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔄 관심종목 수집 시작... (수분 소요)")
+    await run_auto_collect(context)
+
 # ------------------------------------------------------------------ #
 #  봇 실행                                                             #
 # ------------------------------------------------------------------ #
@@ -531,12 +770,13 @@ def run_bot():
     # 커맨드 핸들러
     app.add_handler(CommandHandler("register", handle_register))
     app.add_handler(CommandHandler("briefing", handle_briefing_now))
+    app.add_handler(CommandHandler("collect",  handle_collect_now))
 
     # 메시지 핸들러
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # 매일 오전 7시(KST) 브리핑 — PTB 내장 JobQueue 사용
+    # 매일 오전 7시(KST) 브리핑
     async def briefing_job(context: ContextTypes.DEFAULT_TYPE):
         await send_briefing(context.bot)
 
@@ -544,7 +784,14 @@ def run_bot():
         briefing_job,
         time=dtime(hour=7, minute=0, second=0, tzinfo=KST),
     )
-    print("⏰ 브리핑 스케줄 등록: 매일 오전 7:00 KST")
+    print("⏰ 브리핑 스케줄 등록: 매일 오전 7:00 KST", flush=True)
+
+    # 매일 밤 11시(KST) 관심종목 자동 수집
+    app.job_queue.run_daily(
+        run_auto_collect,
+        time=dtime(hour=23, minute=0, second=0, tzinfo=KST),
+    )
+    print("⏰ 자동 수집 스케줄 등록: 매일 밤 23:00 KST", flush=True)
 
     app.run_polling()
 
