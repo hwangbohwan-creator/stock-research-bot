@@ -17,12 +17,15 @@ import re
 import sys
 import json
 from urllib.parse import urlparse, parse_qs
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ---- 설정 ----
 SHEET_NAME   = "미국주식 리서치"
 CREDS_FILE   = "credentials.json"
-GEMINI_API_KEY  = "AIzaSyAhTicJqr1UWlqPAGbKyLg_Xj0KUpdQJnA"
-TELEGRAM_TOKEN  = "8513472599:AAFT6cGolTaEfqlY5_y5FrF_Dn_-DWQamcM"
+GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 
 TAB_YOUTUBE = "유튜브"
 TAB_TEXT    = "텍스트"
