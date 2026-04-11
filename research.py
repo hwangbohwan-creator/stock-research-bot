@@ -34,6 +34,7 @@ SEEN_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen_u
 WATCHLIST     = ["CRCL", "RKLB", "IREN", "TSLA", "INTC", "BTC-USD", "ETH-USD"]
 AUTO_TICKERS  = ["TSLA", "IREN", "RKLB", "CRCL"]   # 자동 수집 관심종목
 EDGAR_FORMS   = ["8-K", "10-Q", "10-K"]
+FORM_LIMITS   = {"8-K": 3, "10-Q": 1, "10-K": 1}   # 폼별 티커당 최대 수집 건수
 EDGAR_UA      = "stock-research-bot contact@research.com"
 KST           = pytz.timezone("Asia/Seoul")
 
@@ -443,11 +444,13 @@ def fetch_edgar_filings(ticker: str, cik: str, seen: set) -> list[dict]:
             seen.add(link)
     return new_filings
 
-def collect_edgar(seen: set, is_first_run: bool = False) -> dict:
+def collect_edgar(seen: set, is_first_run: bool = False, cutoff_days: int = 7) -> dict:
     """관심종목 공시 수집 → 기업공시 탭 저장. 티커별 저장 건수 dict 반환.
 
-    is_first_run=True: 최근 7일치 공시만 수집 (seen_urls.json 없을 때)
+    is_first_run=True: 최근 cutoff_days일치 공시만 수집 (seen_urls.json 없을 때)
     is_first_run=False: seen에 없는 새 URL만 수집
+    폼별 제한: FORM_LIMITS (8-K 3건, 10-Q/10-K 각 1건)
+    날짜: 수집일이 아니라 SEC Filing Date 사용
     """
     cik_map = {}
     try:
@@ -463,16 +466,15 @@ def collect_edgar(seen: set, is_first_run: bool = False) -> dict:
         return {t: 0 for t in AUTO_TICKERS}
 
     ws = connect_tab(TAB_FILING)
-    today = datetime.now(KST).strftime("%Y-%m-%d")
     counts = {t: 0 for t in AUTO_TICKERS}
 
-    # 첫 실행 시 7일 기준일 계산
-    cutoff_date = (datetime.now(KST) - timedelta(days=7)).strftime("%Y-%m-%d") if is_first_run else None
-    # 첫 실행은 더 많은 항목을 가져와 7일치를 확보, 이후엔 최신 10건으로 충분
+    # 첫 실행 시 cutoff_days 기준일 계산
+    cutoff_date = (datetime.now(KST) - timedelta(days=cutoff_days)).strftime("%Y-%m-%d") if is_first_run else None
+    # 첫 실행은 더 많은 항목을 가져와 cutoff_days치를 확보, 이후엔 최신 10건으로 충분
     fetch_count = 40 if is_first_run else 10
 
     if is_first_run:
-        print(f"  ℹ️ 첫 실행 — 최근 7일 ({cutoff_date} 이후) 공시만 수집")
+        print(f"  ℹ️ 첫 실행 — 최근 {cutoff_days}일 ({cutoff_date} 이후) 공시만 수집")
 
     for ticker in AUTO_TICKERS:
         info = cik_map.get(ticker.upper())
@@ -482,6 +484,7 @@ def collect_edgar(seen: set, is_first_run: bool = False) -> dict:
         cik, company_name = info
 
         for form in EDGAR_FORMS:
+            limit = FORM_LIMITS.get(form, 3)
             url = (
                 f"https://www.sec.gov/cgi-bin/browse-edgar"
                 f"?action=getcompany&CIK={cik}&type={form}"
@@ -489,21 +492,31 @@ def collect_edgar(seen: set, is_first_run: bool = False) -> dict:
             )
             feedparser.USER_AGENT = EDGAR_UA
             feed = feedparser.parse(url)
+            form_saved = 0
 
             for entry in feed.entries:
                 link = entry.get("link", "")
                 if not link:
                     continue
 
-                # 첫 실행: 7일 이내 항목만, 이후: seen에 없는 항목만
-                if is_first_run:
-                    entry_date = entry.get("updated", "")[:10]
-                    if entry_date < cutoff_date:
-                        seen.add(link)   # 오래된 항목은 seen에 등록만 하고 건너뜀
-                        continue
-                else:
-                    if link in seen:
-                        continue
+                # ① 중복 체크 — seen에 있으면 무조건 건너뜀
+                if link in seen:
+                    continue
+
+                filing_date = entry.get("updated", "")[:10]  # SEC 공시 실제 날짜
+
+                # ② 첫 실행: 7일 이전 항목은 seen 등록만 하고 건너뜀
+                if is_first_run and filing_date < cutoff_date:
+                    seen.add(link)
+                    continue
+
+                # ③ 폼별 수집 한도 초과 시 seen 등록 후 건너뜀
+                if form_saved >= limit:
+                    seen.add(link)
+                    continue
+
+                # ④ seen에 즉시 등록 (이후 루프나 재실행에서 중복 방지)
+                seen.add(link)
 
                 # 공시 index 페이지에서 실제 문서 URL 추출
                 doc_url = _get_edgar_doc_url(link)
@@ -529,7 +542,7 @@ def collect_edgar(seen: set, is_first_run: bool = False) -> dict:
                     analysis.setdefault("company", company_name)
                     analysis.setdefault("ticker", ticker)
                     ws.append_row([
-                        today,
+                        filing_date,                              # SEC 실제 공시 날짜
                         analysis.get("company", company_name),
                         analysis.get("ticker", ticker),
                         analysis.get("filing_type", form),
@@ -538,10 +551,9 @@ def collect_edgar(seen: set, is_first_run: bool = False) -> dict:
                         analysis.get("impact", ""),
                         link,
                     ])
-                    print(f"  📋 [{ticker}] {form} 저장: {entry.get('title','')[:50]}")
+                    print(f"  📋 [{ticker}] {form} ({filing_date}) 저장: {entry.get('title','')[:50]}")
                     counts[ticker] += 1
-
-                seen.add(link)
+                    form_saved += 1
 
     return counts
 
@@ -835,6 +847,27 @@ def main():
     if "--setup" in sys.argv:
         ensure_all_tabs()
         print("✅ 탭 설정 완료")
+        return
+
+    if "--test-collect" in sys.argv:
+        print("🧹 기업공시 탭 초기화 중...")
+        ws = connect_tab(TAB_FILING)
+        ws.clear()
+        ws.append_row(HEADERS_FILING)
+        print("✅ 시트 초기화 완료")
+
+        if os.path.exists(SEEN_FILE):
+            os.remove(SEEN_FILE)
+            print("✅ seen_urls.json 삭제 완료")
+
+        print("\n🔄 테스트 수집 시작 (첫 실행 모드 — 최근 30일)...")
+        seen, is_first_run = load_seen()
+        counts = collect_edgar(seen, is_first_run=True, cutoff_days=30)
+        save_seen(seen)
+        total = sum(counts.values())
+        print(f"\n✅ 테스트 수집 완료 — 총 {total}건")
+        for t in AUTO_TICKERS:
+            print(f"  {t}: {counts.get(t, 0)}건")
         return
 
     if len(sys.argv) > 1:
