@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(pip3 install:*)",
+      "Bash(kill 3459)",
+      "Bash(python3 research.py --bot)",
+      "Read(//tmp/**)",
+      "Bash(systemctl --version)",
+      "Bash(systemctl status:*)",
+      "Bash(bash:*)",
+      "Bash(gh auth:*)",
+      "Bash(git --version)",
+      "Bash(git config:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(curl:*)",
+      "Bash(git branch:*)",
+      "Bash(git commit -m 'Initial commit: 미국주식 리서치 텔레그램 봇:*)",
+      "Bash(git remote:*)",
+      "Bash(git push:*)",
+      "Bash(> /home/hbhw0w/주식리서치/bot.log)",
+      "Bash(git commit -m 'feat: 매일 오전 7시 KST 주식 브리핑 자동 발송:*)",
+      "Bash(chmod +x /home/hbhw0w/주식리서치/ngrok.sh)",
+      "Read(//mnt/c/**)",
+      "Read(//c/Users/Administrator/**)"
+    ]
+  }
+}

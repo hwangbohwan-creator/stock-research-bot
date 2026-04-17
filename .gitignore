@@ -9,6 +9,12 @@ bot.log
 chat_id.txt
 nohup.out
 
+# ngrok + code-server 런타임 파일
+ngrok.pid
+ngrok.log
+code-server.pid
+code-server.log
+
 # Python
 __pycache__/
 *.py[cod]
